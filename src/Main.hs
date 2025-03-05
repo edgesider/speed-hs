@@ -22,13 +22,6 @@ import System.IO (stdout)
 import Text.Printf (printf)
 import GHC.IO.Handle (hFlush)
 
-jsonParse :: IO ()
-jsonParse = do
-  let res = decode $ U8.fromString "{\"你\":\"\"}" :: Maybe Value
-  case res of
-    Just (Object obj) -> mapM_ (TIO.putStrLn . K.toText) $ KM.keys obj
-    Nothing -> print "failed to parse"
-
 main :: IO ()
 main = do
   req' <- parseRequest "https://test.ustc.edu.cn/backend/garbage.php?r=0.5811532106165538&ckSize=100"

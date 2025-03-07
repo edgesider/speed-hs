@@ -30,6 +30,7 @@ dependencies:
 - transformers
 - time
 - random
+- containers
 
 ghc-options:
 # - -Wall

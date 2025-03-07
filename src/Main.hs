@@ -1,10 +1,12 @@
+{-# LANGUAGE FlexibleInstances #-}
 {-# LANGUAGE OverloadedStrings #-}
+{-# LANGUAGE ScopedTypeVariables #-}
 
 module Main (main) where
 
 import Conduit as C
 import Control.Applicative (liftA)
-import Control.Monad (when)
+import Control.Monad (unless, when)
 import Control.Monad.IO.Class (MonadIO (liftIO))
 import Control.Monad.Trans.State.Strict
 import Data.Aeson (Value (..), decode)
@@ -14,33 +16,76 @@ import Data.ByteString as BS hiding (putStr)
 import qualified Data.ByteString.Lazy.UTF8 as U8
 import qualified Data.Conduit.List as CL
 import Data.HashMap.Strict (keys)
-import Data.IORef (IORef, modifyIORef', newIORef, readIORef)
+import Data.IORef (IORef, modifyIORef', newIORef, readIORef, writeIORef)
 import qualified Data.Text.IO as TIO
 import Data.Time
+import GHC.IO.Handle (hFlush)
 import Network.HTTP.Simple
 import System.IO (stdout)
 import Text.Printf (printf)
-import GHC.IO.Handle (hFlush)
+import System.Random (randomRIO)
+
+data AppState = AppState
+  { totalSize :: Int,
+    receivedSize :: Int,
+    startTime :: UTCTime,
+    lastReceivedTime :: UTCTime,
+    lastProgressTime :: UTCTime
+  }
+  deriving (Show)
 
 main :: IO ()
 main = do
-  req' <- parseRequest "https://test.ustc.edu.cn/backend/garbage.php?r=0.5811532106165538&ckSize=100"
+  let totalSize = 100
+
+  r <- randomRIO (0.0, 1.0) :: IO Double
+  req' <- parseRequest $ "https://test.ustc.edu.cn/backend/garbage.php?r=" ++ show r ++ "&ckSize=" ++ show totalSize
   let req = setRequestMethod "get" $ setRequestHeader "Cookie" ["ustc=1"] req'
 
-  startTime <- getCurrentTime
+  now <- getCurrentTime
+  stateRef <-
+    newIORef
+      AppState
+        { totalSize = 1024 * 1024 * totalSize,
+          receivedSize = 0,
+          startTime = now,
+          lastReceivedTime = UTCTime (ModifiedJulianDay 0) 0,
+          lastProgressTime = now
+        }
+  httpSink req (const $ loop stateRef)
+  finalState <- readIORef stateRef
 
-  totalRef <- newIORef 0
-  httpSink req $ const $ loop (1024 * 1024 * 100) totalRef startTime
-  total <- readIORef totalRef
-
-  endTime <- getCurrentTime
-  let diff = diffUTCTime endTime startTime
-
+  let diff = lastReceivedTime finalState `diffUTCTime` startTime finalState
   putStrLn "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-  putStrLn $ "总下载大小: " ++ formatSize total
+  putStrLn $ "总下载大小: " ++ formatSize (receivedSize finalState)
   putStrLn $ "测试时间: " ++ show (realToFrac diff :: Double) ++ " 秒"
-  putStrLn $ "下载速度: " ++ formatSpeed ((fromIntegral total :: Double) / realToFrac diff)
-  putStrLn "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+  putStrLn $ "下载速度: " ++ formatSpeed ((fromIntegral (receivedSize finalState) :: Double) / realToFrac diff)
+  putStrLn "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+
+loop :: IORef AppState -> ConduitM ByteString Void IO ()
+loop stateRef = do
+  mx <- await
+  case mx of
+    Nothing -> finish
+    Just x -> do
+      state <- liftIO $ do
+        now <- getCurrentTime
+        state <- readIORef stateRef
+        writeIORef stateRef $ state {receivedSize = receivedSize state + BS.length x, lastReceivedTime = now}
+        progress state
+      if receivedSize state >= totalSize state
+        then finish
+        else loop stateRef
+  where
+    finish = liftIO $ putStr "\r"
+    progress state = do
+      state <- readIORef stateRef
+      when (lastReceivedTime state `diffUTCTime` lastProgressTime state > 0.5) $ do
+        liftIO $ do
+          putStr $ "\r" ++ formatSize (receivedSize state) ++ " / " ++ formatSize (totalSize state) ++ Prelude.replicate 5 ' '
+          hFlush stdout
+          writeIORef stateRef $ state {lastProgressTime = lastReceivedTime state}
+      readIORef stateRef
 
 formatSize :: (Show a, Integral a) => a -> [Char]
 formatSize bytes
@@ -56,28 +101,3 @@ formatSpeed bytesPerSec
   | otherwise = printf "%.2f GB/s" (speed / 1024)
   where
     speed = bytesPerSec / 1024 / 1024
-
-loop :: Int -> IORef Int -> UTCTime -> ConduitM ByteString Void IO ()
-loop sum totalRef lastProgressTime = do
-  mx <- await -- 等待数据块
-  case mx of
-    Nothing -> return () -- 无数据时结束
-    Just x -> do
-      -- 更新状态：累加当前数据块长度
-      liftIO $ modifyIORef' totalRef (+ BS.length x)
-      total <- liftIO $ readIORef totalRef
-      t <- liftIO $ printProgress sum total lastProgressTime
-      if total > sum
-        then do
-          return ()
-        else loop sum totalRef t -- 递归处理下一个数据块
-
-printProgress :: Int -> Int -> UTCTime -> IO UTCTime
-printProgress sum received lastProgressTime = do
-  now <- getCurrentTime
-  if now `diffUTCTime` lastProgressTime > 0.5
-    then do
-      putStr $ formatSize received ++ " / " ++ formatSize sum ++ Prelude.replicate 5 ' ' ++ "\r"
-      hFlush stdout
-      return now
-    else return lastProgressTime

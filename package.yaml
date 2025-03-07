@@ -29,6 +29,7 @@ dependencies:
 - conduit
 - transformers
 - time
+- random
 
 ghc-options:
 # - -Wall

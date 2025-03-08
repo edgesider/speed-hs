@@ -1,25 +1,28 @@
+{-# LANGUAGE BlockArguments #-}
 {-# LANGUAGE FlexibleInstances #-}
 {-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE ScopedTypeVariables #-}
 
 module Main (main) where
 
+import Codec.Binary.UTF8.Generic (fromString)
 import Conduit as C
 import Control.Applicative (liftA)
 import Control.Concurrent (forkIO, threadDelay)
 import Control.Concurrent.MVar (MVar, modifyMVar_, newEmptyMVar, newMVar, putMVar, readMVar)
 import qualified Control.Concurrent.MVar as MVar
-import Control.Monad (forM, forM_, unless, when)
+import Control.Monad (forM, forM_, forever, unless, when)
 import Control.Monad.IO.Class (MonadIO (liftIO))
 import Control.Monad.Trans.State.Strict
 import Data.Aeson (Value (..), decode)
 import qualified Data.Aeson.Key as K
 import qualified Data.Aeson.KeyMap as KM
-import qualified Data.ByteString as BS hiding (putStr)
-import qualified Data.ByteString.Lazy.UTF8 as U8
+import qualified Data.ByteString as BS
+import qualified Data.ByteString as CL
+import Data.Conduit
 import qualified Data.Conduit.List as CL
 import Data.HashMap.Strict (keys)
-import Data.IORef (IORef, modifyIORef', newIORef, readIORef, writeIORef)
+import Data.IORef (IORef, modifyIORef, modifyIORef', newIORef, readIORef, writeIORef)
 import qualified Data.Map.Strict as Map
 import qualified Data.Text.IO as TIO
 import Data.Time
@@ -34,78 +37,144 @@ data ThreadState = ThreadState
   { threadId :: Int,
     finished :: Bool,
     totalSize :: Int,
-    receivedSize :: Int,
+    transferredSize :: Int,
     startTime :: UTCTime,
-    lastReceivedTime :: UTCTime,
-    lastProgressTime :: UTCTime
+    lastTransferTime :: UTCTime
   }
   deriving (Show)
 
 data TestResult = TestResult
-  { downloadSize :: Int,
-    testDuration :: Double,
-    downloadSpeed :: Double
+  { transferred :: Int,
+    duration :: Double,
+    speed :: Double
   }
   deriving (Show)
 
 main :: IO ()
 main = do
-  let numThreads = 10 -- 并发线程数
-      totalSize = 30 -- 每个线程下载的大小
-  -- TODO 删除resultsMvar
-  resultsMVar <- newMVar Map.empty
-  progressMVar <- newMVar Map.empty
+  test True
+  test False
+  where
+    numThreads = 8 -- 并发线程数
+    totalSize = 1024 * 1024 * 100 -- 传输大小
+    test isDownload = do
+      progressMVar <- newMVar Map.empty
+      -- 创建多个测试线程
+      let run = if isDownload then runDownload else runUpload
+      forM_ [1 .. numThreads] $ \tid -> do
+        forkIO $ run tid (totalSize `div` numThreads) progressMVar
 
-  -- 创建多个测试线程
-  forM_ [1 .. numThreads] $ \threadId -> do
-    forkIO $ runSpeedTest threadId (totalSize `div` numThreads) resultsMVar progressMVar
+      allDone <- newEmptyMVar
+      forkIO $ showProgress progressMVar allDone
 
-  allDoneMVar <- newEmptyMVar
-  -- 显示进度的线程
-  forkIO $ showProgress progressMVar allDoneMVar
+      -- 等待所有测试完成并显示结果
+      readMVar allDone
+      -- TODO 应该查看所有线程并行阶段的速度，而不是等待所有线程完成，或者是根据所有线程传输的总量决定是否终止
+      showResult isDownload progressMVar
 
-  -- 等待所有测试完成并显示结果
-  _ <- readMVar allDoneMVar
-  -- TODO 应该查看所有线程并行阶段的速度，而不是等待所有线程完成
-  showResult resultsMVar numThreads
-
-runSpeedTest :: Int -> Int -> MVar (Map.Map Int TestResult) -> MVar (Map.Map Int ThreadState) -> IO ()
-runSpeedTest threadId size resultsMVar progressMVar = do
+runUpload :: Int -> Int -> MVar (Map.Map Int ThreadState) -> IO ()
+runUpload tid bytes progressMVar = do
   r <- randomRIO (0.0, 1.0) :: IO Double
-  req' <- parseRequest $ "https://test.ustc.edu.cn/backend/garbage.php?r=" ++ show r ++ "&ckSize=" ++ show size
+  req' <- parseRequest $ "http://test.ustc.edu.cn/backend/empty.php?r=" ++ show r
+  let req =
+        setRequestMethod "post"
+          $ setRequestHeader "Cookie" ["ustc=1"]
+          $ setRequestHeader "Content-Type" ["application/x-www-form-urlencoded"]
+          $ setRequestBodySource
+            (fromIntegral bytes)
+            (byteChunks bytes .| monitorSource tid progressMVar)
+          $ req'
+  state <- initThreadState bytes tid
+  modifyMVar_ progressMVar $ \m -> return $ Map.insert tid state m
+
+  httpLBS req
+  return ()
+
+monitorSource :: Int -> MVar (Map.Map Int ThreadState) -> ConduitT BS.ByteString BS.ByteString IO ()
+monitorSource tid progressMVar = do
+  sendingSize <- liftIO $ newIORef 0
+  CL.mapM $ \chunk -> do
+    let done = BS.length chunk == 0 -- 最后一块大小为0,表示结束
+    liftIO do
+      -- 此时，上一个数据块被发出去了
+      sent <- readIORef sendingSize
+      now <- getCurrentTime
+      state <- getThreadState tid progressMVar
+      updateThreadState
+        tid
+        progressMVar
+        state
+          { transferredSize = sent,
+            lastTransferTime = now,
+            finished = done
+          }
+
+      -- chunk 是将要被发送的数据块，还没被发出去，更新下发送之后的大小，以便下次使用
+      modifyIORef' sendingSize \s -> s + BS.length chunk
+    return chunk
+
+runDownload :: Int -> Int -> MVar (Map.Map Int ThreadState) -> IO ()
+runDownload tid bytes progressMVar = do
+  r <- randomRIO (0.0, 1.0) :: IO Double
+  let blockSize = ceiling $ (fromIntegral bytes :: Double) / 1024 / 1024
+  req' <-
+    parseRequest $
+      "https://test.ustc.edu.cn/backend/garbage.php?r="
+        ++ show r
+        ++ "&ckSize="
+        ++ show blockSize
+
   let req = setRequestMethod "get" $ setRequestHeader "Cookie" ["ustc=1"] req'
 
+  state <- initThreadState bytes tid
+  modifyMVar_ progressMVar $ \m -> return $ Map.insert tid state m
+
+  httpSink req $ const $ monitorSink tid progressMVar
+
+monitorSink :: Int -> MVar (Map.Map Int ThreadState) -> ConduitM BS.ByteString Void IO ()
+monitorSink tid progressMVar =
+  do
+    CL.mapM $ \chunk -> do
+      now <- getCurrentTime
+      state <- getThreadState tid progressMVar
+      let recv = transferredSize state + BS.length chunk
+      let done = recv >= totalSize state
+      updateThreadState
+        tid
+        progressMVar
+        state
+          { transferredSize = recv,
+            lastTransferTime = now,
+            finished = done
+          }
+      return $ not done
+    .| takeWhileC id
+    .| CL.mapM_ \_ -> return ()
+
+byteChunks :: Int -> ConduitT () BS.ByteString IO ()
+byteChunks = loop
+  where
+    chunkSize = 1024 * 1024
+    loop remain
+      | remain <= 0 = do
+          yield $ BS.pack [] -- 多生成一个空块，以便下游能感知到最后一块发送完毕
+      | otherwise = do
+          let currentChunk = BS.replicate (min remain chunkSize) 30
+          yield currentChunk
+          loop (remain - chunkSize)
+
+initThreadState :: Int -> Int -> IO ThreadState
+initThreadState size tid = do
   now <- getCurrentTime
-
-  -- 更新进度状态
-  modifyMVar_ progressMVar $ \m ->
-    return $
-      Map.insert
-        threadId
-        ThreadState
-          { totalSize = 1024 * 1024 * size,
-            receivedSize = 0,
-            startTime = now,
-            lastReceivedTime = now,
-            lastProgressTime = now,
-            threadId = threadId,
-            finished = False
-          }
-        m
-
-  httpSink req (const $ loop threadId progressMVar)
-  finalState <- getThreadState threadId progressMVar
-
-  let diff = lastReceivedTime finalState `diffUTCTime` startTime finalState
-      result =
-        TestResult
-          { downloadSize = receivedSize finalState,
-            testDuration = realToFrac diff,
-            downloadSpeed = (fromIntegral (receivedSize finalState) :: Double) / realToFrac diff
-          }
-
-  -- 更新结果
-  modifyMVar_ resultsMVar $ \m -> return $ Map.insert threadId result m
+  return
+    ThreadState
+      { totalSize = size,
+        transferredSize = 0,
+        startTime = now,
+        lastTransferTime = UTCTime (ModifiedJulianDay 0) 0,
+        threadId = tid,
+        finished = False
+      }
 
 getThreadState :: Int -> MVar (Map.Map Int ThreadState) -> IO ThreadState
 getThreadState selfTid progressMVar = do
@@ -114,27 +183,10 @@ getThreadState selfTid progressMVar = do
     Just s -> return s
     Nothing -> error "thread state not found"
 
-updateThreadState :: Int -> ThreadState -> MVar (Map.Map Int ThreadState) -> IO ()
-updateThreadState selfTid newState progressMVar = do
+updateThreadState :: Int -> MVar (Map.Map Int ThreadState) -> ThreadState -> IO ()
+updateThreadState selfTid progressMVar newState = do
   modifyMVar_ progressMVar $
     \m -> return $ Map.insert selfTid newState m
-
-loop :: Int -> MVar (Map.Map Int ThreadState) -> ConduitM BS.ByteString Void IO ()
-loop selfTid progressMVar = do
-  mx <- await
-  case mx of
-    Nothing -> return ()
-    Just x -> do
-      state <- liftIO $ do
-        now <- getCurrentTime
-        map <- readMVar progressMVar
-        state <- getThreadState selfTid progressMVar
-        let newState = state {receivedSize = receivedSize state + BS.length x, lastReceivedTime = now}
-        updateThreadState selfTid newState progressMVar
-        return newState
-      if receivedSize state >= totalSize state
-        then liftIO $ updateThreadState selfTid (state {finished = True}) progressMVar
-        else loop selfTid progressMVar
 
 showProgress :: MVar (Map.Map Int ThreadState) -> MVar Bool -> IO ()
 showProgress progressMVar allDoneMVar = do
@@ -143,7 +195,7 @@ showProgress progressMVar allDoneMVar = do
     loop' = do
       threadDelay 500000 -- 每0.5秒更新一次
       states <- readMVar progressMVar
-      let sumRecv = Map.foldl (\acc state -> acc + receivedSize state) 0 states
+      let sumRecv = Map.foldl (\acc state -> acc + transferredSize state) 0 states
       let targetRecv = Map.foldl (\acc state -> acc + totalSize state) 0 states
       putStr $
         "\r"
@@ -157,20 +209,32 @@ showProgress progressMVar allDoneMVar = do
         then loop'
         else putMVar allDoneMVar True
 
-showResult :: MVar (Map.Map Int TestResult) -> Int -> IO ()
-showResult resultsMVar numThreads = do
-  results <- readMVar resultsMVar
-  -- 计算总的下载数据和总时间
-  let totalBytes = sum $ map (downloadSize . snd) $ Map.toList results
-      avgDuration = sum $ map (testDuration . snd) $ Map.toList results
-      totalSpeed = sum $ map (downloadSpeed . snd) $ Map.toList results
+calcResult :: ThreadState -> TestResult
+calcResult state =
+  TestResult
+    { transferred = transferred,
+      duration = duration,
+      speed = (fromIntegral transferred :: Double) / duration
+    }
+  where
+    duration = realToFrac $ lastTransferTime state `diffUTCTime` startTime state
+    transferred = transferredSize state
 
-  putStrLn "\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-  putStrLn "总体统计:"
-  putStrLn $ "  总下载大小: " ++ formatSize totalBytes
-  putStrLn $ "  平均测试时间: " ++ printf "%.2f" avgDuration ++ " 秒"
-  putStrLn $ "  总下载速度: " ++ formatSpeed totalSpeed False ++ " (" ++ formatSpeed totalSpeed True ++ ")"
-  putStrLn "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+showResult :: Bool -> MVar (Map.Map Int ThreadState) -> IO ()
+showResult isDownload progressMVar = do
+  progress <- readMVar progressMVar
+  -- 计算总的下载数据和总时间
+  let results = map (calcResult . snd) (Map.toList progress)
+  let totalBytes = sum $ map transferred results
+      avgDuration = sum (map duration results) / fromIntegral (Map.size progress)
+      totalSpeed = sum $ map speed results
+  putStr "\r"
+  putStrLn $
+    (if isDownload then "⬇️  " else "⬆️  ")
+      ++ formatSpeed totalSpeed False
+      ++ " ("
+      ++ formatSpeed totalSpeed True
+      ++ ") ⚡"
 
 formatSize :: (Show a, Integral a) => a -> [Char]
 formatSize bytes

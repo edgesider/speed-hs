@@ -24,11 +24,16 @@ source-repository head
 executable speedtest
   main-is: Main.hs
   other-modules:
-      Paths_speedtest
-  autogen-modules:
-      Paths_speedtest
+      Summary
+      Utils
   hs-source-dirs:
       src
+  default-extensions:
+      BlockArguments
+      FlexibleInstances
+      LambdaCase
+      OverloadedStrings
+      ScopedTypeVariables
   ghc-options: -Wcompat -Widentities -Wincomplete-record-updates -Wincomplete-uni-patterns -Wmissing-export-lists -Wmissing-home-modules -Wpartial-fields -Wredundant-constraints -threaded -rtsopts -with-rtsopts=-N
   build-depends:
       aeson

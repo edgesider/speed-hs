@@ -69,7 +69,6 @@ runUpload tid bytes summaryMVar = do
   r <- randomStr
   req' <- parseRequest $ "http://test.ustc.edu.cn/backend/empty.php?r=" ++ r
 
-  -- TODO 拆分成多个小块上传
   let req =
         setRequestMethod "post"
           $ setRequestHeader "Cookie" ["ustc=1"]
